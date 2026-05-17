@@ -1,0 +1,21 @@
+{
+	"name": "mac-earlyapply-worker",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "tsx src/server.ts",
+		"start": "tsx src/server.ts",
+		"check": "tsc --noEmit",
+		"test": "tsx --test tests/*.test.ts"
+	},
+	"engines": {
+		"node": ">=22.0.0",
+		"npm": ">=10.9.2"
+	},
+	"devDependencies": {
+		"@types/node": "^22.19.19",
+		"tsx": "^4.22.0",
+		"typescript": "^5.9.3"
+	}
+}
