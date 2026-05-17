@@ -10,9 +10,27 @@ type GenerateResult = {
 	companySlug: string;
 	message: string;
 	logPath: string;
+	publish?: PublishResult;
 };
 
 type GenerateMode = "generate" | "heal";
+type PublishResult =
+	| {
+			status: "published";
+			remoteUrl: string;
+			branch: string;
+			path: string;
+	  }
+	| {
+			status: "skipped";
+			reason: string;
+			path: string;
+	  };
+
+const SCRAPER_GITHUB_REMOTE_URL =
+	process.env.SCRAPER_GITHUB_REMOTE_URL ??
+	"https://github.com/itsKarad/ntnh-earlyapply-scrapers";
+const SCRAPER_GITHUB_BRANCH = process.env.SCRAPER_GITHUB_BRANCH ?? "main";
 
 export async function resolveGeneratePlan(companyName: string): Promise<{
 	mode: GenerateMode;
@@ -136,6 +154,21 @@ async function runProcess(
 	});
 }
 
+async function runProcessExitCode(
+	command: string,
+	args: string[],
+	logPath: string,
+): Promise<number> {
+	try {
+		await runProcess(command, args, logPath);
+		return 0;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		const match = message.match(/exited with code (\d+)/);
+		return match ? Number.parseInt(match[1], 10) : 1;
+	}
+}
+
 async function buildProcessEnv(): Promise<NodeJS.ProcessEnv> {
 	const home = process.env.HOME;
 	const preferredDirs: string[] = [];
@@ -188,6 +221,77 @@ async function buildProcessEnv(): Promise<NodeJS.ProcessEnv> {
 	};
 }
 
+function shouldPublishScrapers(): boolean {
+	const value = process.env.SCRAPER_GITHUB_PUBLISH;
+	return value === undefined || !["0", "false", "no"].includes(value.trim().toLowerCase());
+}
+
+async function ensureGithubRemote(logPath: string): Promise<void> {
+	const hasOrigin = await runProcessExitCode("git", ["remote", "get-url", "origin"], logPath);
+	if (hasOrigin === 0) {
+		await runProcess("git", ["remote", "set-url", "origin", SCRAPER_GITHUB_REMOTE_URL], logPath);
+		return;
+	}
+	await runProcess("git", ["remote", "add", "origin", SCRAPER_GITHUB_REMOTE_URL], logPath);
+}
+
+async function publishScraper(input: {
+	companyName: string;
+	companySlug: string;
+	logPath: string;
+}): Promise<PublishResult> {
+	const scraperPath = path.posix.join("generated_scrapers", input.companySlug);
+	if (!shouldPublishScrapers()) {
+		return {
+			status: "skipped",
+			reason: "SCRAPER_GITHUB_PUBLISH is disabled",
+			path: scraperPath,
+		};
+	}
+
+	await ensureGithubRemote(input.logPath);
+	await runProcess("git", ["branch", "-M", SCRAPER_GITHUB_BRANCH], input.logPath);
+	await runProcess("git", ["add", "--", scraperPath], input.logPath);
+
+	const noStagedChanges = await runProcessExitCode(
+		"git",
+		["diff", "--cached", "--quiet", "--", scraperPath],
+		input.logPath,
+	);
+	if (noStagedChanges === 0) {
+		return {
+			status: "skipped",
+			reason: "No scraper changes to commit",
+			path: scraperPath,
+		};
+	}
+
+	await runProcess(
+		"git",
+		[
+			"commit",
+			"--only",
+			"-m",
+			`chore(scraper): publish ${input.companySlug} scraper`,
+			"--",
+			scraperPath,
+		],
+		input.logPath,
+	);
+	await runProcess(
+		"git",
+		["push", "-u", "origin", `HEAD:${SCRAPER_GITHUB_BRANCH}`],
+		input.logPath,
+	);
+
+	return {
+		status: "published",
+		remoteUrl: SCRAPER_GITHUB_REMOTE_URL,
+		branch: SCRAPER_GITHUB_BRANCH,
+		path: scraperPath,
+	};
+}
+
 export async function generateOrHealScraper(input: {
 	companyName: string;
 	jobBoardUrl: string;
@@ -235,12 +339,18 @@ export async function generateOrHealScraper(input: {
 			jobBoardUrl: input.jobBoardUrl,
 			maxJobs: 3,
 		});
+		const publish = await publishScraper({
+			companyName: input.companyName,
+			companySlug,
+			logPath,
+		});
 
 		return {
 			status: mode === "heal" ? "healed" : "generated",
 			companySlug,
 			message: validation.message,
 			logPath,
+			publish,
 		};
 	} catch (error) {
 		return {

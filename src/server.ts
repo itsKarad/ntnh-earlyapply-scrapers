@@ -3,6 +3,11 @@ import { randomUUID } from "node:crypto";
 import { generateOrHealScraper } from "./generate.js";
 import { createLogger, loadScraper, newRunId, scraperExists } from "./runtime.js";
 
+const SCRAPER_GITHUB_REMOTE_URL =
+	process.env.SCRAPER_GITHUB_REMOTE_URL ??
+	"https://github.com/itsKarad/ntnh-earlyapply-scrapers";
+const SCRAPER_GITHUB_BRANCH = process.env.SCRAPER_GITHUB_BRANCH ?? "main";
+
 type JsonRecord = Record<string, unknown>;
 type QueueJobInput = {
 	companyName: string;
@@ -90,9 +95,16 @@ async function postCallback(input: QueueJobInput, result: JsonRecord): Promise<b
 	}
 
 	const status = result.status === "failed" ? "failed" : "ready";
+	const companySlug = typeof result.companySlug === "string" ? result.companySlug : null;
+	const scraperPath = companySlug ? `generated_scrapers/${companySlug}/index.ts` : null;
 	const payload = {
 		companyName: input.companyName,
 		companyPageId: input.companyPageId,
+		companySlug,
+		scraperPath,
+		scraperGithubUrl: scraperPath
+			? `${SCRAPER_GITHUB_REMOTE_URL}/blob/${SCRAPER_GITHUB_BRANCH}/${scraperPath}`
+			: null,
 		status,
 		message: typeof result.message === "string" ? result.message : null,
 	};
