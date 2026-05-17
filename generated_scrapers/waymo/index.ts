@@ -8,9 +8,12 @@ import type {
 
 const OFFICIAL_BOARD_URL = "https://careers.withwaymo.com/jobs/search";
 const WAYMO_ORIGIN = "https://careers.withwaymo.com";
-const USER_AGENT = "EarlyApply generated Waymo scraper";
+const USER_AGENT =
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 const REQUEST_TIMEOUT_MS = 15_000;
+const FETCH_ATTEMPTS = 3;
 const MAX_UNBOUNDED_SEARCH_PAGES = 100;
+const SEARCH_PAGE_SIZE = 30;
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 type JsonObject = { [key: string]: JsonValue };
@@ -134,7 +137,11 @@ function normalizeWaymoJobUrl(value: string | null | undefined): string | null {
 	if (!/(^|\.)careers\.withwaymo\.com$/i.test(parsed.hostname)) {
 		return null;
 	}
-	if (!/^\/jobs\/(?!search\/?$).+/i.test(parsed.pathname)) {
+	const isSlugJob = /^\/jobs\/(?!search\/?$).+/i.test(parsed.pathname);
+	const isLegacyJob =
+		/^\/jobs\/?$/i.test(parsed.pathname) &&
+		["gh_jid", "job_id", "jobId", "id"].some((key) => Boolean(parsed.searchParams.get(key)));
+	if (!isSlugJob && !isLegacyJob) {
 		return null;
 	}
 
@@ -147,6 +154,11 @@ function requestHeaders(accept: string): HeadersInit {
 		"accept-language": "en-US,en;q=0.9",
 		"cache-control": "no-cache",
 		pragma: "no-cache",
+		referer: `${WAYMO_ORIGIN}/`,
+		"sec-fetch-dest": "document",
+		"sec-fetch-mode": "navigate",
+		"sec-fetch-site": "same-origin",
+		"upgrade-insecure-requests": "1",
 		"user-agent": USER_AGENT,
 	};
 }
@@ -168,23 +180,54 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-async function fetchText(url: string): Promise<FetchTextResult> {
-	try {
-		const response = await fetchWithTimeout(url, "text/html,application/xhtml+xml");
-		if (response.status === 404 || response.status === 410) {
-			return { status: response.status, html: null, error: null };
-		}
-		if (!response.ok) {
-			if (response.status >= 400 && response.status < 500) {
-				return { status: response.status, html: null, error: `HTTP ${response.status}` };
-			}
-			throw new Error(`Waymo request failed with HTTP ${response.status}`);
-		}
+function shouldRetryStatus(status: number): boolean {
+	return status === 408 || status === 425 || status === 429 || status >= 500;
+}
 
-		return { status: response.status, html: await response.text(), error: null };
-	} catch (error) {
-		return { status: null, html: null, error: errorMessage(error) };
+async function delay(ms: number): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchText(url: string): Promise<FetchTextResult> {
+	let lastResult: FetchTextResult = { status: null, html: null, error: "request was not attempted" };
+
+	for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt += 1) {
+		try {
+			const response = await fetchWithTimeout(url, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+			if (response.status === 404 || response.status === 410) {
+				return { status: response.status, html: null, error: null };
+			}
+			if (!response.ok) {
+				lastResult = { status: response.status, html: null, error: `HTTP ${response.status}` };
+				if (attempt < FETCH_ATTEMPTS && shouldRetryStatus(response.status)) {
+					await delay(250 * attempt);
+					continue;
+				}
+
+				return lastResult;
+			}
+
+			const html = await response.text();
+			if (!html.trim()) {
+				lastResult = { status: response.status, html: null, error: "empty response body" };
+				if (attempt < FETCH_ATTEMPTS) {
+					await delay(250 * attempt);
+					continue;
+				}
+
+				return lastResult;
+			}
+
+			return { status: response.status, html, error: null };
+		} catch (error) {
+			lastResult = { status: null, html: null, error: errorMessage(error) };
+			if (attempt < FETCH_ATTEMPTS) {
+				await delay(250 * attempt);
+			}
+		}
 	}
+
+	return lastResult;
 }
 
 function extractAttribute(tag: string, name: string): string | null {
@@ -281,7 +324,7 @@ async function fetchSearchJobs(ctx: ScraperCompanyContext): Promise<SearchPageJo
 	}
 
 	const jobs = new Map<string, SearchPageJob>();
-	const maxPages = limit === null ? MAX_UNBOUNDED_SEARCH_PAGES : Math.max(1, Math.ceil(limit / 5) + 10);
+	const maxPages = limit === null ? MAX_UNBOUNDED_SEARCH_PAGES : Math.max(1, Math.ceil(limit / SEARCH_PAGE_SIZE) + 2);
 
 	for (let page = 1; page <= maxPages; page += 1) {
 		const url = searchPageUrl(page);
@@ -315,7 +358,7 @@ async function fetchSearchJobs(ctx: ScraperCompanyContext): Promise<SearchPageJo
 			}
 		}
 
-		if (pageJobs.length === 0 || jobs.size === beforeCount || !hasNextPage(result.html, page)) {
+		if (pageJobs.length === 0 || (jobs.size === beforeCount && page > 1) || !hasNextPage(result.html, page)) {
 			break;
 		}
 	}
@@ -461,8 +504,11 @@ function parseSalary(description: string | null): {
 	const salaryLine =
 		description
 			.split("\n")
-			.find((line) => /\$\s?\d[\d,]*(?:\.\d+)?\s*(?:-|to)\s*\$?\s?\d[\d,]*/i.test(line)) ?? null;
-	const rangeMatch = salaryLine?.match(/\$\s?(\d[\d,]*(?:\.\d+)?)\s*(?:-|to)\s*\$?\s?(\d[\d,]*(?:\.\d+)?)/i);
+			.find((line) => /\$\s?\d[\d,]*(?:\.\d+)?\s*(?:-|\u2013|\u2014|to)\s*\$?\s?\d[\d,]*/i.test(line)) ??
+		null;
+	const rangeMatch = salaryLine?.match(
+		/\$\s?(\d[\d,]*(?:\.\d+)?)\s*(?:-|\u2013|\u2014|to)\s*\$?\s?(\d[\d,]*(?:\.\d+)?)/i,
+	);
 	const salaryMin = rangeMatch?.[1] ? Number(rangeMatch[1].replace(/,/g, "")) : null;
 	const salaryMax = rangeMatch?.[2] ? Number(rangeMatch[2].replace(/,/g, "")) : null;
 
@@ -518,6 +564,28 @@ function descriptionFromHtml(html: string): string | null {
 	return description || text;
 }
 
+function locationPartsFromLine(line: string): string[] {
+	const withoutJobMetadata = line
+		.replace(
+			/\b(?:Full[-\s]?Time|Part[-\s]?Time|Contract|Internship|Temporary|On Site|On-site|Remote|Hybrid)\b.*$/i,
+			"",
+		)
+		.trim();
+	const parts = withoutJobMetadata
+		.split(/\s*(?:;|\||\/|\.\s+(?=[A-Z])|,?\s+and\s+)\s*/i)
+		.map((part) => compactText(part))
+		.filter((part): part is string => Boolean(part))
+		.filter((part) => !/^\d{3,}$/.test(part));
+
+	return parts.length > 0 ? parts : [line];
+}
+
+function looksLikeLocation(value: string): boolean {
+	return /(?:^|\b)(United States|India|Japan|Poland|Taiwan|United Kingdom|Remote|California|Arizona|New York|Washington|District of Columbia|Georgia|Illinois|Karnataka|Masovian|Mazowieckie|Michigan|Pennsylvania|Taipei|Telangana|Tokyo|England|Mountain View|San Francisco|Los Angeles|Tempe|London|Warsaw|New York City|Pittsburgh|Hsinchu|Hyderabad|Bengaluru|Chicago|Atlanta|Novi)\b/i.test(
+		value,
+	);
+}
+
 function parseLocationsFromLines(lines: string[]): string[] {
 	const headerLines = lines.slice(0, Math.min(lines.length, 80));
 	const values: string[] = [];
@@ -532,8 +600,10 @@ function parseLocationsFromLines(lines: string[]): string[] {
 		if (/^\d{3,}$/.test(line)) {
 			continue;
 		}
-		if (/(?:^|\b)(United States|Canada|California|Arizona|New York|Washington|Texas|Georgia|Michigan|Remote)\b/i.test(line)) {
-			values.push(line);
+		for (const part of locationPartsFromLine(line)) {
+			if (looksLikeLocation(part)) {
+				values.push(part);
+			}
 		}
 	}
 
