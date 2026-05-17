@@ -9,7 +9,8 @@ import type {
 const OFFICIAL_BOARD_URL = "https://www.amazon.jobs/en/";
 const AMAZON_ORIGIN = "https://www.amazon.jobs";
 const SEARCH_API_URL = "https://www.amazon.jobs/en/search.json";
-const DEFAULT_PAGE_SIZE = 10;
+const DEFAULT_FIRST_RUN_LIMIT = 50;
+const DEFAULT_PAGE_SIZE = 50;
 const REQUEST_TIMEOUT_MS = 15_000;
 const USER_AGENT =
 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 EarlyApply";
@@ -58,7 +59,7 @@ type FetchDetailResult =
 
 function maxJobsLimit(ctx: ScraperCompanyContext): number | null {
 	if (ctx.maxJobs === undefined) {
-		return null;
+		return DEFAULT_FIRST_RUN_LIMIT;
 	}
 	if (!Number.isFinite(ctx.maxJobs)) {
 		return 0;
@@ -298,16 +299,23 @@ async function fetchAmazonJobs(ctx: ScraperCompanyContext): Promise<AmazonSearch
 	}
 
 	const jobs: AmazonSearchJob[] = [];
+	let offset = 0;
 	let total: number | null = null;
 
 	while (maxJobs === null || jobs.length < maxJobs) {
 		const pageLimit = Math.min(DEFAULT_PAGE_SIZE, maxJobs === null ? DEFAULT_PAGE_SIZE : maxJobs - jobs.length);
-		const page = await fetchSearchPage(ctx, jobs.length, pageLimit);
+		const page = await fetchSearchPage(ctx, offset, pageLimit);
 		const pageJobs = Array.isArray(page.jobs) ? page.jobs : [];
 		total = typeof page.hits === "number" && Number.isFinite(page.hits) ? page.hits : total;
 
+		if (!pageJobs.length) {
+			break;
+		}
+
 		jobs.push(...pageJobs.slice(0, maxJobs === null ? undefined : maxJobs - jobs.length));
-		if (pageJobs.length < pageLimit || (total !== null && jobs.length >= total)) {
+		offset += pageJobs.length;
+
+		if ((total === null && pageJobs.length < pageLimit) || (total !== null && offset >= total)) {
 			break;
 		}
 	}
